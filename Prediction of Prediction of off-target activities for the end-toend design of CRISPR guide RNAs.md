@@ -92,8 +92,71 @@ e-CRISPR， CRISPR-DO, CROP-IT and COSMID。（所算法使用的搜索算法不
 #### CFD模型（预测脱靶模型）：
 
 * 首先计算CD33数据中每种单个错配类型的gRNA-target对活性的*观测频率（observed frequency）*。
+
 * 然后针对有多个误匹配的gRNA-target对，CFD通过将单个错配频率*乘到*一起进行组合。
 
+  * 例如，如果gRNA-target对在位置3处有A：G误匹配，在位置5处有T：C误匹配，并且在目标区域有“CG”的PAM存在，则CFD将会计算这个gRNA的脱靶评分为：$CFD \ score=P(active | A:G,3) \times P(active | T:C,5) \times P(active | CG)$  
+
+    这些项每个都是根据CD33训练集数据中（只包含单个误匹配或备用PAM，但是不会同时包含两者）观察到的频率来计算的。    
+
+* CFD作为**朴素贝叶斯**：可以把CFD算法解释为分类模型---朴素贝叶斯。  
+
+  * $Y=1$表示一个gRNA-target对有活性，$Y=0$表示这个对没有活性。
+
+  * 用$X_i$表示特征比如（T:G，5），$i$简单的指示了这些特征的枚举（即一个one-hot编码）。如果特征（误匹配）发生----$X_i=1$，如果没有发生----$X_i=0$。因此，在CD33数据集中（只有单个误匹配），一个特殊的gRNA-target对仅有一个$X_i=1$，其他的都为$X_i=0$。在这个定义下，可以重写针对一个gRNA-target对的CFD为：$CFD=\prod_{i\in\{i | X_i=1\}} \ P(Y=1 | X_i=1)$。  
+
+    贝叶斯模型将会计算在给定的特征值下，一个gRNA-target对是有活性的概率为：
+
+    $Naive Bayes \equiv P(Y=1 |\{X_j\})=\frac{P(Y=1)}{P(\{X_j\})}) \prod_i P(X_i | Y=1)$      
+
+    其中，$X_j$为所有特征$X_i$的集合。假设在gRNA是有活性的情况下，特征$X_i$是独立的使得：$P(\{X_j\}|Y=1)=\prod_iP(X_i|Y=1)$。使用Bayes规则，可以重写朴素贝叶斯分类器为：
+
+    $NaiveBayes\equiv P(Y=1|\{X_j\})=\frac{P(Y=1)}{P(\{X_j\})}\prod_iP(Y=1|X_i)\frac{P(X_i)}{P(Y=1)}=\frac{1}{P(\{X_j\})}\prod_iP(Y=1|X_i)P(X_i)$  
+
+    如果做出两个更近一步的假设，会发现朴素贝叶斯分类器恰好与CFD匹配。*第一个假设*假设特征略微独立，也就是说：$\prod_iP(X_i)=P(\{X_j\})$，在这种情况下，朴素贝叶斯可以简化为：  
+
+    $NaiveBayes_{feat.ind.}=\prod_iP(Y=1|X_i)$    
+
+    在Elevation-score中也可以做出同样的假设。如果假设$P(Y=1|X_i=0)=1$，那么CFD和朴素贝叶斯将会是独立的。关键的问题是询问训练数据集的那些属性能够推广到模型可能应用的不可见数据集中。特别地，可以有理由的假设$P(Y=1|X_i=1)$是一个可以推广到其他数据集的quality。这个quality反映了我们观察到一种特定类型的不匹配的情况下gRNA的活跃可能性。因此他与在训练与测试集中不匹配类型的分布无关。定义了在没有观察到特征的情况下，gRNA是活跃的可能性。
+
+    CFD假设为$P(Y=1|X_i=0)=1$。
+
+    
+
+  #### Elevation-score作为两层堆栈回归：  
+
+  可以从CFD中推广出三种主要的方式：  
+
+  * 使用回归代替分类器。
+  * 增大了特征空间。
+  * 组合使用机器学习方法取代了乘法结合概率的先验方法。  
+
+  模型值执行前两步，具体方法为：
+
+  * 首先将CD33LFC数值转换为位于范围内。他们可以被解释成概率，再使用核密度估计器将每个LFC变换成核密度估计中的LFC的累积密度。在这里使用**高斯核**并通过**tenfold cross-validation（十倍交叉验证）**来选择频率长度。
+  * Elevation-score被分为两层：
+    * 第一层对gRNA-target对中的单个误匹配进行预测（*第一层单个误匹配回归模型*）$p(y|\{X_j\})$：
+      * 使用**boosted regression trees（boosted回归树）**（使用scikit-learn库的默认配置）在CD33数据集上执行。由于每个gRNA-target对在这些数据上只有一个$X_i=1$，也可以使用**线性回归模型**来进行预测。但是希望gRNA-target对更加丰富。因此希望这些特征能够在一个**非线性方法**中相互影响。特别地，会使用特征的“解耦”版本，比如编码形式之一‘A:G’----这是one-hot。还有其他位置的整数特征。CFD是将这些组合在一起作为一个单独的特征。还包括突变是否是颠倒或过渡。使用这些改进的并组合每一个误匹配的模型，正如CFD所作的将这些值相乘一样----Elevation-naive。
+    * 第二层组合这些多个误匹配：  
+      * 我们将Elevation-score的第二层作为组合器，因为它学习如何以更细致的方式将来自单个不匹配模型的预测结合起来，而不是简单地将它们相乘，从而允许减轻某些陈述的假设。 使用**数据驱动及其学习方法**来调整如何去组合他们。使用第一层boosted回归树模型J次来对J个单个gRNA-target对进行预测（也就是说，J个特征有着$X_j=1$），产生J个预测$\hat{y}_i \in [0,1]$(每一个特征有$X_j=1$,并且针对剩余的K个有着的$X_k=0$特征设置$\hat{y}_k =1$)。每一个gRNA-target对有$T=J+K=21$个boosted回归树预测。（20个可能的误匹配位置和一个PAM）作为特征。这21个特征的$log$:$\{log(\hat{y_t})\}$以及他们的总和，乘积和J（误匹配数和PAM数）作为第二层模型**L1正则线性回归**模型的输入。
+      * 最后，因为我们最终想要的是对gRNA-target对进仓库有效的可能性的预测，我们还要对来自**L1回归组合器模型**的输出应用了一个最终变换。通过一个**校准模型**来转换输出。  
+        * 校准模型使用**逻辑回归模型**使用Elevation-naive训练得到的预测作为输入来估计$P(active|GUIDE \ - \ seq \ normalized \ counts)$，然后使用相对应的二值观测活性（LFC>1)作为目标变量。-----只有回归的表现会影响这个转换，同gRNA-target评分无关。（即使是很简单的线性变换也可能会改变聚合分数。）  
+
+  #### Elevation-聚合：    
+
+  Elevation-score值提供了选择具有最小期望脱靶活性的gRNA的初始条件。*最终的结果需要将多个值聚合成一个以进行排序。* 
+
+  * 开发一个基于**梯度boosted回归树**的模型来执行Elevation-aggregate。超参数的设置选择通过使用一个*随机搜索*的*交叉验证*方法：$losses ∈ {least \ squares; least \ absolute \ deviation; Huber}$,$learning \ rates \in [1.0 × 10−6, 1.0]$ 在在对数空间中等间隔的100点,$the \ number \ of \ estimators \in [20, 50, 80, 100, 200, 300, 400, 500]$, 最大树深范围为 1 到 7, 最小分割样本数量 = [2, 3, 4], $splitting \ criterion \in  [Friedman \ mean-squared \ error, mean-squared \ error, mean absolute \ error]$.
+
+  
+
+  
+
+  
+
+  
+
+  
 
 
 
@@ -122,12 +185,6 @@ e-CRISPR， CRISPR-DO, CROP-IT and COSMID。（所算法使用的搜索算法不
 
 
 
-
-
-所用到的机器学习算法：  
-
-* 双层回归模型
-* boosted回归树
 
 
 
